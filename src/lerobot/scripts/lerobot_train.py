@@ -246,6 +246,27 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     if is_main_process:
         logging.info("Creating policy")
+    # CUDAGraphs (used by "max-autotune" and "reduce-overhead") is incompatible with gradient
+    # accumulation: multiple forward passes before backward overwrite tensors captured in the graph.
+    # When compile_mode is None (default), each policy's modeling file resolves it to a policy-specific
+    # default (e.g. "max-autotune" for pi0/pi05, "reduce-overhead" for diffusion). When gradient
+    # accumulation is enabled, we override None to a safe default here before policy creation.
+    if hasattr(cfg.policy, "compile_mode") and cfg.policy.compile_model:
+        if cfg.policy.compile_mode is None and cfg.gradient_accumulation_steps > 1:
+            cfg.policy.compile_mode = "max-autotune-no-cudagraphs"
+            logging.warning(
+                f"gradient_accumulation_steps={cfg.gradient_accumulation_steps} is incompatible with "
+                f"CUDAGraphs. Setting compile_mode to 'max-autotune-no-cudagraphs'. "
+                f"To silence this warning, set compile_mode explicitly."
+            )
+        if cfg.policy.compile_mode is not None:
+            _CUDAGRAPHS_MODES = {"max-autotune", "reduce-overhead"}
+            if cfg.gradient_accumulation_steps > 1 and cfg.policy.compile_mode in _CUDAGRAPHS_MODES:
+                raise ValueError(
+                    f"compile_mode='{cfg.policy.compile_mode}' uses CUDAGraphs which is incompatible "
+                    f"with gradient_accumulation_steps > 1. "
+                    f"Use 'max-autotune-no-cudagraphs' or 'default' instead."
+                )
     policy = make_policy(
         cfg=cfg.policy,
         ds_meta=dataset.meta,

@@ -149,7 +149,7 @@ class DiffusionConfig(PreTrainedConfig):
 
     # Optimization
     compile_model: bool = False
-    compile_mode: str = "reduce-overhead"
+    compile_mode: str | None = None  # Torch compile mode (None = auto-select based on training config)
 
     # Loss computation
     do_mask_loss_for_padding: bool = False
