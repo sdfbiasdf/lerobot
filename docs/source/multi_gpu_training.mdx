@@ -134,14 +134,21 @@ This gives an effective batch size of 16 × 2 = 32, while only using memory for 
 
 When using `gradient_accumulation_steps > 1` with `compile_model=true`, CUDAGraphs-based compile modes (`max-autotune`, `reduce-overhead`) are incompatible because multiple forward passes before backward overwrite tensors captured in the graph.
 
-LeRobot handles this automatically:
+LeRobot handles this automatically. Each policy declares its own preferred and safe compile modes:
+
+| Policy | `DEFAULT_COMPILE_MODE` | `SAFE_COMPILE_MODE` (used with grad. accumulation) |
+|---|---|---|
+| `pi0`, `pi05`, `pi0_fast`, `smolvla` | `max-autotune` | `max-autotune-no-cudagraphs` |
+| `diffusion` | `reduce-overhead` | `default` |
+
+Resolution rules:
 
 | `compile_mode` | `gradient_accumulation_steps > 1` | Behavior |
 |---|---|---|
-| Not set (default) | No | Policy-specific default (e.g. `max-autotune`) |
-| Not set (default) | Yes | Auto-resolved to `max-autotune-no-cudagraphs` |
-| `max-autotune` | Yes | `ValueError` — set `max-autotune-no-cudagraphs` explicitly |
-| `max-autotune-no-cudagraphs` | Yes | Works as expected |
+| Not set (default) | No | Policy's `DEFAULT_COMPILE_MODE` |
+| Not set (default) | Yes | Policy's `SAFE_COMPILE_MODE` (logged as a warning) |
+| `max-autotune` or `reduce-overhead` | Yes | `ValueError` — pick a non-CUDAGraphs mode |
+| `max-autotune-no-cudagraphs` or `default` | Yes | Used as-is |
 
 ### Combining with Multi-GPU
 
