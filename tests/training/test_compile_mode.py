@@ -14,115 +14,95 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for compile_mode resolution with gradient accumulation.
+"""Tests for ``PreTrainedConfig.resolve_compile_mode``.
 
 CUDAGraphs (used by 'max-autotune' and 'reduce-overhead') is incompatible with
 gradient accumulation because multiple forward passes before backward overwrite
-tensors captured in the graph. These tests verify that compile_mode is resolved
-correctly for all combinations of compile settings and gradient accumulation.
+tensors captured in the graph. ``resolve_compile_mode`` is the single source of
+truth that picks a safe mode per policy.
 """
 
 import pytest
 
-from lerobot.policies.pi05.configuration_pi05 import PI05Config
+from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
+from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pi0_fast.configuration_pi0_fast import PI0FastConfig
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
-from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+
+ALL_CONFIGS = [PI0Config, PI05Config, PI0FastConfig, SmolVLAConfig, DiffusionConfig]
 
 
-# -- Test default compile_mode is None across all policies --
+# -- Defaults ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize("config_cls", ALL_CONFIGS)
+def test_compile_mode_field_defaults_to_none(config_cls):
+    assert config_cls().compile_mode is None
 
 
 @pytest.mark.parametrize(
-    "config_cls",
-    [PI05Config, PI0Config, PI0FastConfig, SmolVLAConfig, DiffusionConfig],
+    "config_cls,expected_default,expected_safe",
+    [
+        (PI0Config, "max-autotune", "max-autotune-no-cudagraphs"),
+        (PI05Config, "max-autotune", "max-autotune-no-cudagraphs"),
+        (PI0FastConfig, "max-autotune", "max-autotune-no-cudagraphs"),
+        (SmolVLAConfig, "max-autotune", "max-autotune-no-cudagraphs"),
+        (DiffusionConfig, "reduce-overhead", "default"),
+    ],
 )
-def test_default_compile_mode_is_none(config_cls):
-    """All policy configs should default compile_mode to None."""
-    config = config_cls()
-    assert config.compile_mode is None
+def test_class_compile_mode_constants(config_cls, expected_default, expected_safe):
+    assert config_cls.DEFAULT_COMPILE_MODE == expected_default
+    assert config_cls.SAFE_COMPILE_MODE == expected_safe
 
 
-# -- Test modeling fallback: None resolves to policy-specific default --
+# -- resolve_compile_mode: implicit (compile_mode=None) ---------------------
 
 
-def test_pi05_compile_mode_fallback():
-    config = PI05Config(compile_model=True)
-    compile_mode = config.compile_mode or "max-autotune"
-    assert compile_mode == "max-autotune"
+@pytest.mark.parametrize("config_cls", ALL_CONFIGS)
+def test_resolve_none_without_accumulation_returns_default(config_cls):
+    config = config_cls(compile_model=True)
+    assert config.resolve_compile_mode(gradient_accumulation_steps=1) == config.DEFAULT_COMPILE_MODE
 
 
-def test_diffusion_compile_mode_fallback():
+@pytest.mark.parametrize("config_cls", ALL_CONFIGS)
+def test_resolve_none_with_accumulation_returns_safe(config_cls):
+    config = config_cls(compile_model=True)
+    assert config.resolve_compile_mode(gradient_accumulation_steps=4) == config.SAFE_COMPILE_MODE
+
+
+def test_resolve_diffusion_safe_mode_is_default_not_max_autotune():
+    """Diffusion's safe fallback must be 'default' (lightweight), not the heavy
+    autotune-based fallback used by pi0/pi05."""
     config = DiffusionConfig(compile_model=True)
-    compile_mode = config.compile_mode or "reduce-overhead"
-    assert compile_mode == "reduce-overhead"
+    assert config.resolve_compile_mode(gradient_accumulation_steps=2) == "default"
 
 
-# -- Test compile_mode resolution logic from lerobot_train.py --
-# This replicates the logic in lerobot_train.py without requiring a full training setup.
+# -- resolve_compile_mode: explicit user values -----------------------------
 
 
-def _resolve_compile_mode(policy_config, gradient_accumulation_steps: int):
-    """Replicate the compile_mode resolution logic from lerobot_train.py."""
-    _CUDAGRAPHS_MODES = {"max-autotune", "reduce-overhead"}
-
-    if hasattr(policy_config, "compile_mode") and policy_config.compile_model:
-        if policy_config.compile_mode is None and gradient_accumulation_steps > 1:
-            policy_config.compile_mode = "max-autotune-no-cudagraphs"
-        if policy_config.compile_mode is not None:
-            if gradient_accumulation_steps > 1 and policy_config.compile_mode in _CUDAGRAPHS_MODES:
-                raise ValueError(
-                    f"compile_mode='{policy_config.compile_mode}' uses CUDAGraphs which is incompatible "
-                    f"with gradient_accumulation_steps > 1. "
-                    f"Use 'max-autotune-no-cudagraphs' or 'default' instead."
-                )
+@pytest.mark.parametrize("config_cls", ALL_CONFIGS)
+def test_resolve_explicit_safe_mode_passes_through(config_cls):
+    config = config_cls(compile_model=True, compile_mode="max-autotune-no-cudagraphs")
+    assert config.resolve_compile_mode(gradient_accumulation_steps=4) == "max-autotune-no-cudagraphs"
 
 
-def test_none_with_accumulation_resolves_to_no_cudagraphs():
-    """compile_mode=None + accumulation > 1 should resolve to max-autotune-no-cudagraphs."""
-    config = PI05Config(compile_model=True)
-    _resolve_compile_mode(config, gradient_accumulation_steps=2)
-    assert config.compile_mode == "max-autotune-no-cudagraphs"
+@pytest.mark.parametrize("config_cls", ALL_CONFIGS)
+def test_resolve_explicit_default_mode_passes_through(config_cls):
+    config = config_cls(compile_model=True, compile_mode="default")
+    assert config.resolve_compile_mode(gradient_accumulation_steps=4) == "default"
 
 
-def test_none_without_accumulation_stays_none():
-    """compile_mode=None + accumulation=1 should remain None (resolved by modeling files)."""
-    config = PI05Config(compile_model=True)
-    _resolve_compile_mode(config, gradient_accumulation_steps=1)
-    assert config.compile_mode is None
+@pytest.mark.parametrize("config_cls", ALL_CONFIGS)
+@pytest.mark.parametrize("cudagraphs_mode", ["max-autotune", "reduce-overhead"])
+def test_resolve_explicit_cudagraphs_mode_with_accumulation_raises(config_cls, cudagraphs_mode):
+    config = config_cls(compile_model=True, compile_mode=cudagraphs_mode)
+    with pytest.raises(ValueError, match="CUDAGraphs"):
+        config.resolve_compile_mode(gradient_accumulation_steps=2)
 
 
-def test_explicit_cudagraphs_mode_with_accumulation_raises():
-    """Explicitly setting a CUDAGraphs mode + accumulation > 1 should raise ValueError."""
-    config = PI05Config(compile_model=True, compile_mode="max-autotune")
-    with pytest.raises(ValueError, match="incompatible"):
-        _resolve_compile_mode(config, gradient_accumulation_steps=2)
-
-
-def test_explicit_reduce_overhead_with_accumulation_raises():
-    """reduce-overhead + accumulation > 1 should also raise ValueError."""
-    config = DiffusionConfig(compile_model=True, compile_mode="reduce-overhead")
-    with pytest.raises(ValueError, match="incompatible"):
-        _resolve_compile_mode(config, gradient_accumulation_steps=2)
-
-
-def test_explicit_no_cudagraphs_with_accumulation_ok():
-    """Explicitly setting max-autotune-no-cudagraphs + accumulation should work fine."""
-    config = PI05Config(compile_model=True, compile_mode="max-autotune-no-cudagraphs")
-    _resolve_compile_mode(config, gradient_accumulation_steps=2)
-    assert config.compile_mode == "max-autotune-no-cudagraphs"
-
-
-def test_explicit_default_mode_with_accumulation_ok():
-    """Explicitly setting 'default' mode + accumulation should work fine."""
-    config = PI05Config(compile_model=True, compile_mode="default")
-    _resolve_compile_mode(config, gradient_accumulation_steps=2)
-    assert config.compile_mode == "default"
-
-
-def test_compile_disabled_skips_validation():
-    """When compile_model=False, compile_mode should not be touched regardless of accumulation."""
-    config = PI05Config(compile_model=False, compile_mode="max-autotune")
-    _resolve_compile_mode(config, gradient_accumulation_steps=2)
-    assert config.compile_mode == "max-autotune"  # not touched
+@pytest.mark.parametrize("config_cls", ALL_CONFIGS)
+@pytest.mark.parametrize("cudagraphs_mode", ["max-autotune", "reduce-overhead"])
+def test_resolve_explicit_cudagraphs_mode_without_accumulation_passes(config_cls, cudagraphs_mode):
+    config = config_cls(compile_model=True, compile_mode=cudagraphs_mode)
+    assert config.resolve_compile_mode(gradient_accumulation_steps=1) == cudagraphs_mode
